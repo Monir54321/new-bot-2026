@@ -1,19 +1,18 @@
-const {
-  default: makeWASocket,
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   jidNormalizedUser,
   makeCacheableSignalKeyStore,
   downloadContentFromMessage,
   fetchLatestBaileysVersion,
-} = require("@whiskeysockets/baileys");
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const Database = require("better-sqlite3");
-const P = require("pino");
-const fs = require("fs");
-const { Boom } = require("@hapi/boom");
+} from "@whiskeysockets/baileys";
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
+import Database from "better-sqlite3";
+import P from "pino";
+import fs from "fs";
+import { Boom } from "@hapi/boom";
 
 // --- 1. DATABASE SETUP ---
 const db = new Database("system.db");
@@ -281,7 +280,7 @@ async function startBot() {
               await sock.sendMessage(targetAdminJid, {
                 react: { text: "🚫", key: targetKey },
               });
-            } catch (e) {}
+            } catch (e) { }
           }, 120000);
         }
       }
@@ -338,14 +337,15 @@ app.post("/api/whatsapp/logout", async (req, res) => {
   if (sock) {
     try {
       await sock.logout();
-    } catch (e) {}
+    } catch (e) { }
   }
   fs.rmSync("./auth_session", { recursive: true, force: true });
   process.exit(0);
 });
 
 // --- 4. START SERVER ---
-server.listen(3000, () => {
-  console.log("Master Server Live: http://localhost:3000");
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Master Server Live: http://localhost:${PORT}`);
   startBot();
 });

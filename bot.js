@@ -1,19 +1,18 @@
-const {
-  default: makeWASocket,
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   jidNormalizedUser,
   makeCacheableSignalKeyStore,
   downloadContentFromMessage,
   fetchLatestBaileysVersion,
-} = require("@whiskeysockets/baileys");
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const Database = require("better-sqlite3");
-const P = require("pino");
-const fs = require("fs");
-const { Boom } = require("@hapi/boom");
+} from "@whiskeysockets/baileys";
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
+import Database from "better-sqlite3";
+import P from "pino";
+import fs from "fs";
+import { Boom } from "@hapi/boom";
 
 // --- 1. DATABASE SETUP ---
 const db = new Database("system.db");

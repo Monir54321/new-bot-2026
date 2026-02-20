@@ -262,7 +262,6 @@ async function startBot() {
               [type]: buffer,
               mimetype: mediaContent.mimetype,
               fileName: mediaContent.fileName || `Order_${record.order_id}.pdf`,
-              caption: `Here is your document for Order #${record.order_id}`,
             });
 
             // Mark as Delivered so it can never be sent again
@@ -350,4 +349,3 @@ server.listen(3000, () => {
   console.log("Master Server Live: http://localhost:3000");
   startBot();
 });
-

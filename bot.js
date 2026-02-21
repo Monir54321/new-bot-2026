@@ -7,25 +7,24 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
 import express from "express";
-import http from "http";
+import { createServer } from "http";
 import { Server } from "socket.io";
 import Database from "better-sqlite3";
 import P from "pino";
 import fs from "fs";
 import { Boom } from "@hapi/boom";
 
-// --- 1. DATABASE SETUP ---
+// --- 1. DATABASE SETUP (Self-Hosted) ---
 const db = new Database("system.db");
 db.exec(`
     CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY, name TEXT, phone TEXT, jid TEXT, status TEXT DEFAULT 'ACTIVE');
     CREATE TABLE IF NOT EXISTS clients (id INTEGER PRIMARY KEY, name TEXT, phone TEXT, jid TEXT, status TEXT DEFAULT 'ACTIVE');
     CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, order_id TEXT, customer TEXT, buyer_jid TEXT, content TEXT, admin_name TEXT, seller_forward_id TEXT, buyer_msg_id TEXT, status TEXT, time DATETIME DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 `);
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
+const httpServer = createServer(app);
+const io = new Server(httpServer);
 app.use(express.json());
 app.use(express.static("public"));
 
@@ -33,8 +32,16 @@ let sock;
 let qrCode = null;
 let connectionStatus = "Disconnected";
 
+// --- UTILITIES ---
+const ALLOWED_LENGTHS = [6, 7, 8, 9, 10, 12, 13, 17];
 const cleanPhone = (num) => (num ? num.replace(/\D/g, "") : "");
 
+const parseOrders = (text) => {
+  const allNumbers = text.match(/\d+/g) || [];
+  return allNumbers.filter((num) => ALLOWED_LENGTHS.includes(num.length));
+};
+
+// --- SOCKET.IO SYNC ---
 io.on("connection", (socket) => {
   socket.emit("connection_status", {
     status: connectionStatus,
@@ -43,7 +50,7 @@ io.on("connection", (socket) => {
   if (qrCode && connectionStatus !== "Connected") socket.emit("qr", qrCode);
 });
 
-// --- 2. WHATSAPP ENGINE ---
+// --- WHATSAPP ENGINE ---
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState("auth_session");
   const { version } = await fetchLatestBaileysVersion();
@@ -56,8 +63,8 @@ async function startBot() {
     },
     printQRInTerminal: true,
     logger: P({ level: "silent" }),
-    browser: ["OrderMaster Final", "Chrome", "1.0.0"],
-    keepAliveIntervalMs: 10000, // Keeps connection "Hot"
+    browser: ["OrderMaster Pro", "Chrome", "1.0.0"],
+    keepAliveIntervalMs: 10000,
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -88,35 +95,6 @@ async function startBot() {
     if (!msg.message || msg.key.fromMe) return;
 
     const senderJid = jidNormalizedUser(msg.key.remoteJid);
-
-    // 🎭 REACTION LOGIC (Mirror Admin emoji to Buyer)
-    if (msg.message.reactionMessage) {
-      const r = msg.message.reactionMessage;
-      const admin = db
-        .prepare("SELECT * FROM admins WHERE jid = ?")
-        .get(senderJid);
-      if (admin) {
-        const order = db
-          .prepare(
-            "SELECT buyer_jid, buyer_msg_id FROM orders WHERE seller_forward_id = ?",
-          )
-          .get(r.key.id);
-        if (order) {
-          await sock.sendMessage(order.buyer_jid, {
-            react: {
-              text: r.text || "",
-              key: {
-                remoteJid: order.buyer_jid,
-                fromMe: false,
-                id: order.buyer_msg_id,
-              },
-            },
-          });
-        }
-      }
-      return;
-    }
-
     const text =
       msg.message.conversation ||
       msg.message.extendedTextMessage?.text ||
@@ -125,23 +103,16 @@ async function startBot() {
       msg.message.documentMessage?.fileName ||
       "";
 
-    // 🛡️ AUTHENTICATION & AUTO-LINKING
+    // 🛡️ ADMIN IDENTIFICATION & AUTO-LINKING
     let admin = db.prepare("SELECT * FROM admins WHERE jid = ?").get(senderJid);
-    let client = db
-      .prepare("SELECT * FROM clients WHERE jid = ?")
-      .get(senderJid);
-
-    if (!admin && !client) {
-      const potentialNumbers = text.match(/\d{8,15}/g) || [];
-      for (const rawNum of potentialNumbers) {
-        const num = cleanPhone(rawNum);
+    if (!admin && senderJid.endsWith("@lid")) {
+      const hiddenPn =
+        msg.verifiedName || msg.key.remoteJidAlt || msg.participant;
+      const potentialPn = hiddenPn ? cleanPhone(hiddenPn.split("@")[0]) : null;
+      if (potentialPn) {
         const pAdmin = db
           .prepare("SELECT * FROM admins WHERE REPLACE(phone, '+', '') = ?")
-          .get(num);
-        const pClient = db
-          .prepare("SELECT * FROM clients WHERE REPLACE(phone, '+', '') = ?")
-          .get(num);
-
+          .get(potentialPn);
         if (pAdmin) {
           db.prepare("UPDATE admins SET jid = ? WHERE id = ?").run(
             senderJid,
@@ -150,61 +121,34 @@ async function startBot() {
           admin = db
             .prepare("SELECT * FROM admins WHERE jid = ?")
             .get(senderJid);
-          await sock.sendMessage(senderJid, {
-            text: `✅ Admin Linked: ${admin.name}`,
-          });
-          break;
-        }
-        if (pClient) {
-          db.prepare("UPDATE clients SET jid = ? WHERE id = ?").run(
-            senderJid,
-            pClient.id,
-          );
-          client = db
-            .prepare("SELECT * FROM clients WHERE jid = ?")
-            .get(senderJid);
-          await sock.sendMessage(senderJid, {
-            text: `✅ Client Linked: ${client.name}`,
-          });
-          break;
         }
       }
     }
 
-    if (!admin && !client) return;
-
-    // 📦 CASE A: BUYER -> ADMIN FORWARDING
-    if (client && !admin) {
-      const orderNums = text.match(/\d{8,17}/g);
-      if (!orderNums) return;
-
-      const targetAdmin = db
-        .prepare("SELECT * FROM admins WHERE status = 'ACTIVE' LIMIT 1")
-        .get();
-      if (targetAdmin) {
-        const sent = await sock.sendMessage(targetAdmin.jid, { text: text });
-        db.prepare(
-          "INSERT INTO orders (order_id, customer, buyer_jid, content, admin_name, seller_forward_id, buyer_msg_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        ).run(
-          orderNums[0],
-          client.name,
-          senderJid,
-          text,
-          targetAdmin.name,
-          sent.key.id,
-          msg.key.id,
-          "VALIDATED",
-        );
-        io.emit("new_order", {
-          order_id: orderNums[0],
-          customer: client.name,
-          admin: targetAdmin.name,
-          status: "VALIDATED",
+    // 🎭 1. REACTION LOGIC (Admin to Buyer)
+    if (msg.message.reactionMessage && admin) {
+      const r = msg.message.reactionMessage;
+      const order = db
+        .prepare(
+          "SELECT buyer_jid, buyer_msg_id FROM orders WHERE seller_forward_id = ?",
+        )
+        .get(r.key.id);
+      if (order) {
+        await sock.sendMessage(order.buyer_jid, {
+          react: {
+            text: r.text || "",
+            key: {
+              remoteJid: order.buyer_jid,
+              fromMe: false,
+              id: order.buyer_msg_id,
+            },
+          },
         });
       }
+      return;
     }
 
-    // 📄 CASE B: ADMIN -> BUYER (STRICT 2M DELAY ON DUPLICATE)
+    // 📄 2. ADMIN PDF LOGIC (Strict Rules)
     if (admin) {
       const isMedia = msg.message.documentMessage || msg.message.imageMessage;
       if (!isMedia) return;
@@ -214,40 +158,11 @@ async function startBot() {
         const last4 = orderMatch[0].slice(-4);
         const record = db
           .prepare(
-            "SELECT * FROM orders WHERE order_id LIKE ? ORDER BY time DESC LIMIT 1",
+            "SELECT * FROM orders WHERE order_id LIKE ? AND status = 'VALIDATED' ORDER BY time DESC LIMIT 1",
           )
           .get(`%${last4}`);
 
         if (record) {
-          // --- 🛡️ STRICT RULE: ONE-TIME DELIVERY ---
-          if (record.status === "DELIVERED") {
-            console.log(
-              `[STRICT] Blocked resend for ${last4}. Triggering 2-minute delay.`,
-            );
-
-            // Capture the current message key and sender for the timer closure
-            const targetKey = msg.key;
-            const targetAdminJid = senderJid;
-
-            setTimeout(async () => {
-              try {
-                if (sock) {
-                  await sock.sendMessage(targetAdminJid, {
-                    react: { text: "❓", key: targetKey },
-                  });
-                  console.log(
-                    `[DELAY] Sent '?' reaction to Admin for duplicate order ending in ${last4}`,
-                  );
-                }
-              } catch (e) {
-                console.error("Delayed Reaction Error:", e.message);
-              }
-            }, 120000); // 120,000 ms = 2 Minutes
-
-            return; // STOP HERE
-          }
-
-          // --- NORMAL FIRST-TIME DELIVERY ---
           try {
             const type = msg.message.documentMessage ? "document" : "image";
             const mediaContent =
@@ -263,32 +178,77 @@ async function startBot() {
               fileName: mediaContent.fileName || `Order_${record.order_id}.pdf`,
             });
 
-            // Mark as Delivered so it can never be sent again
             db.prepare(
               "UPDATE orders SET status = 'DELIVERED' WHERE id = ?",
             ).run(record.id);
-            console.log(`[SUCCESS] PDF Delivered to ${record.customer}`);
+            console.log(
+              `[SUCCESS] PDF sent to Buyer for Order ending in ${last4}`,
+            );
           } catch (err) {
-            console.error("Forwarding failed:", err);
+            console.error(err);
           }
         } else {
-          // NO MATCH FOUND - React with 🚫 after 2 minutes to look human
-          const targetKey = msg.key;
-          const targetAdminJid = senderJid;
+          // Check if already delivered for strict reaction
+          const delivered = db
+            .prepare(
+              "SELECT * FROM orders WHERE order_id LIKE ? AND status = 'DELIVERED'",
+            )
+            .get(`%${last4}`);
+          const emoji = delivered ? "❓" : "🚫";
           setTimeout(async () => {
             try {
-              await sock.sendMessage(targetAdminJid, {
-                react: { text: "🚫", key: targetKey },
+              await sock.sendMessage(senderJid, {
+                react: { text: emoji, key: msg.key },
               });
-            } catch (e) { }
-          }, 120000);
+            } catch (e) {}
+          }, 120000); // 2 Minute Delay
         }
+      }
+      return;
+    }
+
+    // 📦 3. BUYER LOGIC (Forwarding)
+    const validOrders = parseOrders(text);
+    if (validOrders.length > 0) {
+      const targetAdmin = db
+        .prepare("SELECT * FROM admins WHERE status = 'ACTIVE' LIMIT 1")
+        .get();
+      if (targetAdmin) {
+        const client = db
+          .prepare("SELECT * FROM clients WHERE jid = ?")
+          .get(senderJid);
+        const customerName = client
+          ? client.name
+          : `@${senderJid.split("@")[0]}`;
+
+        const sent = await sock.sendMessage(targetAdmin.jid, { text: text });
+
+        db.prepare(
+          "INSERT INTO orders (order_id, customer, buyer_jid, content, admin_name, seller_forward_id, buyer_msg_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ).run(
+          validOrders[0],
+          customerName,
+          senderJid,
+          text,
+          targetAdmin.name,
+          sent.key.id,
+          msg.key.id,
+          "VALIDATED",
+        );
+
+        io.emit("new_order", {
+          order_id: validOrders[0],
+          customer: customerName,
+          admin: targetAdmin.name,
+          status: "VALIDATED",
+        });
+        console.log(`[FORWARD] Order ${validOrders[0]} to Admin`);
       }
     }
   });
 }
 
-// --- 3. API ROUTES ---
+// --- API ROUTES ---
 app.get("/api/stats", (req, res) => {
   const total = db.prepare("SELECT COUNT(*) as c FROM orders").get().c;
   const pending = db
@@ -305,7 +265,6 @@ app.get("/api/admins", (req, res) =>
 app.get("/api/clients", (req, res) =>
   res.json(db.prepare("SELECT * FROM clients").all()),
 );
-
 app.post("/api/admins", (req, res) => {
   db.prepare("INSERT INTO admins (name, phone, jid) VALUES (?, ?, ?)").run(
     req.body.name,
@@ -322,8 +281,6 @@ app.post("/api/clients", (req, res) => {
   );
   res.json({ success: true });
 });
-
-// --- NEW DELETE ROUTES ---
 app.delete("/api/admins/:id", (req, res) => {
   db.prepare("DELETE FROM admins WHERE id = ?").run(req.params.id);
   res.json({ success: true });
@@ -332,20 +289,17 @@ app.delete("/api/clients/:id", (req, res) => {
   db.prepare("DELETE FROM clients WHERE id = ?").run(req.params.id);
   res.json({ success: true });
 });
-
 app.post("/api/whatsapp/logout", async (req, res) => {
   if (sock) {
     try {
       await sock.logout();
-    } catch (e) { }
+    } catch (e) {}
   }
   fs.rmSync("./auth_session", { recursive: true, force: true });
   process.exit(0);
 });
 
-// --- 4. START SERVER ---
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Master Server Live: http://localhost:${PORT}`);
+httpServer.listen(3000, () => {
+  console.log(`🚀 Master Server Live: http://localhost:3000`);
   startBot();
 });

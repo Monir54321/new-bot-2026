@@ -14,7 +14,7 @@ import P from "pino";
 import fs from "fs";
 import { Boom } from "@hapi/boom";
 
-// --- 1. DATABASE SETUP (Self-Hosted) ---
+// --- 1. DATABASE SETUP ---
 const db = new Database("system.db");
 db.exec(`
     CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY, name TEXT, phone TEXT, jid TEXT, status TEXT DEFAULT 'ACTIVE');
@@ -32,16 +32,9 @@ let sock;
 let qrCode = null;
 let connectionStatus = "Disconnected";
 
-// --- UTILITIES ---
-const ALLOWED_LENGTHS = [6, 7, 8, 9, 10, 12, 13, 17];
 const cleanPhone = (num) => (num ? num.replace(/\D/g, "") : "");
+const ALLOWED_LENGTHS = [6, 7, 8, 9, 10, 12, 13, 17];
 
-const parseOrders = (text) => {
-  const allNumbers = text.match(/\d+/g) || [];
-  return allNumbers.filter((num) => ALLOWED_LENGTHS.includes(num.length));
-};
-
-// --- SOCKET.IO SYNC ---
 io.on("connection", (socket) => {
   socket.emit("connection_status", {
     status: connectionStatus,
@@ -50,7 +43,6 @@ io.on("connection", (socket) => {
   if (qrCode && connectionStatus !== "Connected") socket.emit("qr", qrCode);
 });
 
-// --- WHATSAPP ENGINE ---
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState("auth_session");
   const { version } = await fetchLatestBaileysVersion();
@@ -63,7 +55,7 @@ async function startBot() {
     },
     printQRInTerminal: true,
     logger: P({ level: "silent" }),
-    browser: ["OrderMaster Pro", "Chrome", "1.0.0"],
+    browser: ["OrderMaster Admin", "Chrome", "1.0.0"],
     keepAliveIntervalMs: 10000,
   });
 
@@ -92,13 +84,11 @@ async function startBot() {
 
   sock.ev.on("messages.upsert", async ({ messages }) => {
     const msg = messages[0];
-    console.log(msg);
     if (!msg.message || msg.key.fromMe) return;
 
-    const rawSender =
-      msg.key.participant || msg.participant || msg.key.remoteJid;
+    const senderJid = jidNormalizedUser(msg.key.remoteJid);
 
-    const senderJid = jidNormalizedUser(rawSender);
+    // Get text from every possible source (Caption, Message, Filename)
     const text =
       msg.message.conversation ||
       msg.message.extendedTextMessage?.text ||
@@ -107,29 +97,30 @@ async function startBot() {
       msg.message.documentMessage?.fileName ||
       "";
 
-    // 🛡️ ADMIN IDENTIFICATION & AUTO-LINKING
-    let admin = db.prepare("SELECT * FROM admins WHERE jid = ?").get(senderJid);
+    // 🛡️ 1. ADMIN IDENTIFICATION (UPGRADED)
+    // Check by JID OR by Phone Number contained in the LID string
+    let admin = db
+      .prepare("SELECT * FROM admins WHERE jid = ? OR phone = ?")
+      .get(senderJid, senderJid.split("@")[0]);
+
     if (!admin && senderJid.endsWith("@lid")) {
-      const hiddenPn =
-        msg.verifiedName || msg.key.remoteJidAlt || msg.participant;
+      const hiddenPn = msg.verifiedName || msg.key.remoteJidAlt;
       const potentialPn = hiddenPn ? cleanPhone(hiddenPn.split("@")[0]) : null;
       if (potentialPn) {
-        const pAdmin = db
+        admin = db
           .prepare("SELECT * FROM admins WHERE REPLACE(phone, '+', '') = ?")
           .get(potentialPn);
-        if (pAdmin) {
+        if (admin) {
           db.prepare("UPDATE admins SET jid = ? WHERE id = ?").run(
             senderJid,
-            pAdmin.id,
+            admin.id,
           );
-          admin = db
-            .prepare("SELECT * FROM admins WHERE jid = ?")
-            .get(senderJid);
+          console.log(`[SYNC] Admin ${admin.name} linked to LID.`);
         }
       }
     }
 
-    // 🎭 1. REACTION LOGIC (Admin to Buyer)
+    // 🎭 2. REACTION LOGIC
     if (msg.message.reactionMessage && admin) {
       const r = msg.message.reactionMessage;
       const order = db
@@ -152,14 +143,22 @@ async function startBot() {
       return;
     }
 
-    // 📄 2. ADMIN PDF LOGIC (Strict Rules)
+    const isMedia = !!(msg.message.imageMessage || msg.message.documentMessage);
+    const isText = !!(
+      msg.message.conversation || msg.message.extendedTextMessage
+    );
+
+    // 📄 3. ADMIN LOGIC (PDF/IMAGE RESPONSE)
     if (admin) {
-      const isMedia = msg.message.documentMessage || msg.message.imageMessage;
-      if (!isMedia) return;
+      if (!isMedia) return; // Ignore Admin text to prevent loops
 
       const orderMatch = text.match(/\d{4,17}/);
       if (orderMatch) {
         const last4 = orderMatch[0].slice(-4);
+        console.log(
+          `[ADMIN] Media received. Searching for Order ending in: ${last4}`,
+        );
+
         const record = db
           .prepare(
             "SELECT * FROM orders WHERE order_id LIKE ? AND status = 'VALIDATED' ORDER BY time DESC LIMIT 1",
@@ -168,91 +167,111 @@ async function startBot() {
 
         if (record) {
           try {
-            const type = msg.message.documentMessage ? "document" : "image";
-            const mediaContent =
+            console.log(
+              `[SUCCESS] Found Order #${record.order_id}. Sending to Buyer: ${record.buyer_jid}`,
+            );
+
+            const mediaType = msg.message.documentMessage
+              ? "document"
+              : "image";
+            const mediaSubObject =
               msg.message.documentMessage || msg.message.imageMessage;
-            const stream = await downloadContentFromMessage(mediaContent, type);
+
+            const stream = await downloadContentFromMessage(
+              mediaSubObject,
+              mediaType,
+            );
             let buffer = Buffer.from([]);
             for await (const chunk of stream)
               buffer = Buffer.concat([buffer, chunk]);
 
             await sock.sendMessage(record.buyer_jid, {
-              [type]: buffer,
-              mimetype: mediaContent.mimetype,
-              fileName: mediaContent.fileName || `Order_${record.order_id}.pdf`,
+              [mediaType]: buffer,
+              mimetype: mediaSubObject.mimetype,
+              fileName:
+                mediaSubObject.fileName || `Order_${record.order_id}.pdf`,
+            
             });
 
             db.prepare(
               "UPDATE orders SET status = 'DELIVERED' WHERE id = ?",
             ).run(record.id);
-            console.log(
-              `[SUCCESS] PDF sent to Buyer for Order ending in ${last4}`,
-            );
+            console.log(`[DELIVERED] PDF successfully sent to Buyer.`);
           } catch (err) {
-            console.error(err);
+            console.error("[ERROR] PDF Send failed:", err);
           }
         } else {
-          // Check if already delivered for strict reaction
-          const delivered = db
+          console.log(`[NOT FOUND] No open order matches '${last4}'`);
+          const alreadyDone = db
             .prepare(
-              "SELECT * FROM orders WHERE order_id LIKE ? AND status = 'DELIVERED'",
+              "SELECT id FROM orders WHERE order_id LIKE ? AND status = 'DELIVERED'",
             )
             .get(`%${last4}`);
-          const emoji = delivered ? "❓" : "🚫";
+          const emoji = alreadyDone ? "❓" : "🚫";
           setTimeout(async () => {
             try {
               await sock.sendMessage(senderJid, {
                 react: { text: emoji, key: msg.key },
               });
-            } catch (e) { }
-          }, 120000); // 2 Minute Delay
+            } catch (e) {}
+          }, 120000);
         }
       }
-      return;
+      return; // Exit Admin logic
     }
 
-    // 📦 3. BUYER LOGIC (Forwarding)
-    const validOrders = parseOrders(text);
-    if (validOrders.length > 0) {
-      const targetAdmin = db
-        .prepare("SELECT * FROM admins WHERE status = 'ACTIVE' LIMIT 1")
-        .get();
-      if (targetAdmin) {
-        const client = db
-          .prepare("SELECT * FROM clients WHERE jid = ?")
-          .get(senderJid);
-        const customerName = client
-          ? client.name
-          : `@${senderJid.split("@")[0]}`;
+    // 📦 4. BUYER LOGIC (STRICT TEXT ONLY)
+    if (!admin) {
+      if (isMedia || !isText) return;
 
-        const sent = await sock.sendMessage(targetAdmin.jid, { text: text });
+      const allNumbers = text.match(/\d+/g) || [];
+      const validOrders = allNumbers.filter((num) =>
+        ALLOWED_LENGTHS.includes(num.length),
+      );
 
-        db.prepare(
-          "INSERT INTO orders (order_id, customer, buyer_jid, content, admin_name, seller_forward_id, buyer_msg_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        ).run(
-          validOrders[0],
-          customerName,
-          senderJid,
-          text,
-          targetAdmin.name,
-          sent.key.id,
-          msg.key.id,
-          "VALIDATED",
-        );
+      if (validOrders.length > 0) {
+        const targetAdmin = db
+          .prepare("SELECT * FROM admins WHERE status = 'ACTIVE' LIMIT 1")
+          .get();
+        if (targetAdmin) {
+          const client = db
+            .prepare("SELECT * FROM clients WHERE jid = ?")
+            .get(senderJid);
+          const customerName = client
+            ? client.name
+            : `@${senderJid.split("@")[0]}`;
 
-        io.emit("new_order", {
-          order_id: validOrders[0],
-          customer: customerName,
-          admin: targetAdmin.name,
-          status: "VALIDATED",
-        });
-        console.log(`[FORWARD] Order ${validOrders[0]} to Admin`);
+          console.log(
+            `[BUYER] Order ${validOrders[0]} detected. Forwarding to Admin...`,
+          );
+          const sent = await sock.sendMessage(targetAdmin.jid, { text: text });
+
+          db.prepare(
+            "INSERT INTO orders (order_id, customer, buyer_jid, content, admin_name, seller_forward_id, buyer_msg_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          ).run(
+            validOrders[0],
+            customerName,
+            senderJid,
+            text,
+            targetAdmin.name,
+            sent.key.id,
+            msg.key.id,
+            "VALIDATED",
+          );
+
+          io.emit("new_order", {
+            order_id: validOrders[0],
+            customer: customerName,
+            admin: targetAdmin.name,
+            status: "VALIDATED",
+          });
+        }
       }
     }
   });
 }
 
-// --- API ROUTES ---
+// --- API ---
 app.get("/api/stats", (req, res) => {
   const total = db.prepare("SELECT COUNT(*) as c FROM orders").get().c;
   const pending = db
@@ -297,7 +316,7 @@ app.post("/api/whatsapp/logout", async (req, res) => {
   if (sock) {
     try {
       await sock.logout();
-    } catch (e) { }
+    } catch (e) {}
   }
   fs.rmSync("./auth_session", { recursive: true, force: true });
   process.exit(0);

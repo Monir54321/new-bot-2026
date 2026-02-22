@@ -204,7 +204,7 @@ async function startBot() {
               await sock.sendMessage(senderJid, {
                 react: { text: emoji, key: msg.key },
               });
-            } catch (e) {}
+            } catch (e) { }
           }, 120000); // 2 Minute Delay
         }
       }
@@ -297,13 +297,14 @@ app.post("/api/whatsapp/logout", async (req, res) => {
   if (sock) {
     try {
       await sock.logout();
-    } catch (e) {}
+    } catch (e) { }
   }
   fs.rmSync("./auth_session", { recursive: true, force: true });
   process.exit(0);
 });
 
-httpServer.listen(3000, () => {
-  console.log(`🚀 Master Server Live: http://localhost:3000`);
+const PORT = process.env.PORT || 3050;
+httpServer.listen(PORT, () => {
+  console.log(`🚀 Master Server Live: http://localhost:${PORT}`);
   startBot();
 });

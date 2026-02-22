@@ -92,9 +92,13 @@ async function startBot() {
 
   sock.ev.on("messages.upsert", async ({ messages }) => {
     const msg = messages[0];
+    console.log(msg);
     if (!msg.message || msg.key.fromMe) return;
 
-    const senderJid = jidNormalizedUser(msg.key.remoteJid);
+    const rawSender =
+      msg.key.participant || msg.participant || msg.key.remoteJid;
+
+    const senderJid = jidNormalizedUser(rawSender);
     const text =
       msg.message.conversation ||
       msg.message.extendedTextMessage?.text ||

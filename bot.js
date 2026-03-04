@@ -12,7 +12,18 @@ import { Server } from "socket.io";
 import Database from "better-sqlite3";
 import P from "pino";
 import fs from "fs";
+import path from "path";
 import { Boom } from "@hapi/boom";
+import axios from "axios";
+import FormData from "form-data";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
+import multer from "multer";
+
+const upload = multer({ dest: "temp_uploads/" });
+
+const JWT_SECRET = "supersecret_whatsapp_bot_key";
+const MASTER_PASSWORD = "123Abc##"; // Default password expected by backend
 
 // --- 1. DATABASE SETUP ---
 const db = new Database("system.db");
@@ -20,7 +31,16 @@ db.exec(`
     CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY, name TEXT, phone TEXT, jid TEXT, status TEXT DEFAULT 'ACTIVE');
     CREATE TABLE IF NOT EXISTS clients (id INTEGER PRIMARY KEY, name TEXT, phone TEXT, jid TEXT, status TEXT DEFAULT 'ACTIVE');
     CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, order_id TEXT, customer TEXT, buyer_jid TEXT, content TEXT, admin_name TEXT, seller_forward_id TEXT, buyer_msg_id TEXT, status TEXT, time DATETIME DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 `);
+
+// Seed master password
+const row = db.prepare("SELECT value FROM settings WHERE key='password'").get();
+if (!row) {
+  const hash = bcrypt.hashSync(MASTER_PASSWORD, 10);
+  db.prepare("INSERT INTO settings (key,value) VALUES ('password',?)").run(hash);
+  console.log("🔑 Master password seeded into DB.");
+}
 
 const app = express();
 const httpServer = createServer(app);
@@ -32,7 +52,27 @@ let sock;
 let qrCode = null;
 let connectionStatus = "Disconnected";
 
-const cleanPhone = (num) => (num ? num.replace(/\D/g, "") : "");
+// --- MIDDLEWARE ---
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: "Forbidden" });
+    req.user = user;
+    next();
+  });
+};
+
+const cleanPhone = (num) => {
+  if (!num) return "";
+  let cleaned = num.replace(/\D/g, "");
+  if (cleaned.length === 11 && cleaned.startsWith("0")) {
+    cleaned = "88" + cleaned;
+  }
+  return cleaned;
+};
 const ALLOWED_LENGTHS = [6, 7, 8, 9, 10, 12, 13, 17];
 
 io.on("connection", (socket) => {
@@ -53,7 +93,6 @@ async function startBot() {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, P({ level: "silent" })),
     },
-    printQRInTerminal: true,
     logger: P({ level: "silent" }),
     browser: ["OrderMaster Admin", "Chrome", "1.0.0"],
     keepAliveIntervalMs: 10000,
@@ -190,7 +229,7 @@ async function startBot() {
               mimetype: mediaSubObject.mimetype,
               fileName:
                 mediaSubObject.fileName || `Order_${record.order_id}.pdf`,
-            
+
             });
 
             db.prepare(
@@ -213,7 +252,7 @@ async function startBot() {
               await sock.sendMessage(senderJid, {
                 react: { text: emoji, key: msg.key },
               });
-            } catch (e) {}
+            } catch (e) { }
           }, 120000);
         }
       }
@@ -316,10 +355,89 @@ app.post("/api/whatsapp/logout", async (req, res) => {
   if (sock) {
     try {
       await sock.logout();
-    } catch (e) {}
+    } catch (e) { }
   }
   fs.rmSync("./auth_session", { recursive: true, force: true });
   process.exit(0);
+});
+
+// --- BACKEND COMPATIBILITY ENDPOINTS ---
+
+// Login with master password -> returns JWT
+app.post("/login", (req, res) => {
+  const { password } = req.body;
+  const row = db.prepare("SELECT value FROM settings WHERE key='password'").get();
+  if (!row) return res.status(500).json({ error: "Password not set" });
+
+  if (!bcrypt.compareSync(password, row.value)) {
+    return res.status(403).json({ error: "Wrong password" });
+  }
+
+  const token = jwt.sign({ role: "admin" }, JWT_SECRET, { expiresIn: "24h" });
+  res.json({ token });
+});
+
+// Send message
+app.post("/send-message", authenticateToken, async (req, res) => {
+  const { number, message } = req.body;
+  try {
+    if (!sock || connectionStatus !== "Connected") {
+      return res.status(503).json({ error: "WhatsApp client not ready" });
+    }
+    const jid = `${cleanPhone(number)}@s.whatsapp.net`;
+    await sock.sendMessage(jid, { text: message });
+    console.log(`[API] Message sent to ${jid}`);
+    res.json({ status: "success" });
+  } catch (err) {
+    console.error(`[API] Send error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Send file
+app.post("/send-file", authenticateToken, upload.single("file"), async (req, res) => {
+  const { number, caption } = req.body;
+  const file = req.file;
+
+  if (!file) return res.status(400).json({ error: "No file provided" });
+
+  try {
+    if (!sock || connectionStatus !== "Connected") {
+      return res.status(503).json({ error: "WhatsApp client not ready" });
+    }
+
+    const jid = `${cleanPhone(number)}@s.whatsapp.net`;
+    const fileContent = fs.readFileSync(file.path);
+    const mimetype = file.mimetype;
+
+    let messageParams = {
+      caption: caption || ""
+    };
+
+    if (mimetype.startsWith("image/")) {
+      messageParams.image = fileContent;
+    } else if (mimetype.startsWith("video/")) {
+      messageParams.video = fileContent;
+    } else if (mimetype.startsWith("audio/")) {
+      messageParams.audio = fileContent;
+    } else {
+      messageParams.document = fileContent;
+      messageParams.fileName = file.originalname;
+      messageParams.mimetype = mimetype;
+    }
+
+    await sock.sendMessage(jid, messageParams);
+    console.log(`[API] File sent to ${jid}`);
+
+    // Cleanup
+    fs.unlinkSync(file.path);
+
+    res.json({ status: "success" });
+  } catch (err) {
+    if (file && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+    console.error(`[API] File send error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 3050;

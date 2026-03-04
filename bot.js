@@ -24,6 +24,7 @@ const upload = multer({ dest: "temp_uploads/" });
 
 const JWT_SECRET = "supersecret_whatsapp_bot_key";
 const MASTER_PASSWORD = "123Abc##"; // Default password expected by backend
+const BACKEND_URL = "http://192.168.0.106:8007"; // Django backend URL
 
 // --- 1. DATABASE SETUP ---
 const db = new Database("system.db");
@@ -73,7 +74,27 @@ const cleanPhone = (num) => {
   }
   return cleaned;
 };
-const ALLOWED_LENGTHS = [6, 7, 8, 9, 10, 12, 13, 17];
+const ALLOWED_LENGTHS = [3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 17];
+
+const syncToBackend = async (orderId, buyerJid, buffer, mediaSubObject) => {
+  try {
+    const formData = new FormData();
+    formData.append("file", buffer, {
+      filename: mediaSubObject.fileName || `${orderId}.pdf`,
+      contentType: mediaSubObject.mimetype,
+    });
+    formData.append("number", buyerJid);
+    formData.append("filename", mediaSubObject.fileName || `${orderId}.pdf`);
+
+    console.log(`[BACKEND] Syncing Order #${orderId} to ${BACKEND_URL}...`);
+    const response = await axios.patch(`${BACKEND_URL}/api/account/orders/auto-complete/`, formData, {
+      headers: formData.getHeaders(),
+    });
+    console.log(`[BACKEND] SUCCESS: Order #${orderId} completed. Response:`, response.data);
+  } catch (backendErr) {
+    console.error(`[BACKEND] ERROR for Order #${orderId}: ${backendErr.response?.data?.error || backendErr.message}`);
+  }
+};
 
 io.on("connection", (socket) => {
   socket.emit("connection_status", {
@@ -114,6 +135,8 @@ async function startBot() {
         phone: sock.user.id.split(":")[0],
       });
       console.log("✅ SYSTEM ONLINE");
+      const admins = db.prepare("SELECT * FROM admins").all();
+      console.log("👥 ACTIVE ADMINS IN DB:", admins);
     }
     if (connection === "close") {
       const code = (lastDisconnect.error instanceof Boom)?.output?.statusCode;
@@ -126,6 +149,7 @@ async function startBot() {
     if (!msg.message || msg.key.fromMe) return;
 
     const senderJid = jidNormalizedUser(msg.key.remoteJid);
+    console.log(`📩 Message received from: ${senderJid} | isMe: ${msg.key.fromMe}`);
 
     // Get text from every possible source (Caption, Message, Filename)
     const text =
@@ -144,19 +168,35 @@ async function startBot() {
 
     if (!admin && senderJid.endsWith("@lid")) {
       const hiddenPn = msg.verifiedName || msg.key.remoteJidAlt;
+      console.log(`🔍 Checking LID alternate IDs - verifiedName: "${msg.verifiedName}", remoteJidAlt: "${msg.key.remoteJidAlt}"`);
       const potentialPn = hiddenPn ? cleanPhone(hiddenPn.split("@")[0]) : null;
       if (potentialPn) {
+        console.log(`🔍 Potential Phone extracted: "${potentialPn}"`);
+        // Robust lookup: check for both with and without 88
+        const shortPn = potentialPn.startsWith("88") ? potentialPn.slice(2) : potentialPn;
+
         admin = db
-          .prepare("SELECT * FROM admins WHERE REPLACE(phone, '+', '') = ?")
-          .get(potentialPn);
+          .prepare("SELECT * FROM admins WHERE REPLACE(phone, '+', '') = ? OR REPLACE(phone, '+', '') = ?")
+          .get(potentialPn, shortPn);
+
         if (admin) {
           db.prepare("UPDATE admins SET jid = ? WHERE id = ?").run(
             senderJid,
             admin.id,
           );
-          console.log(`[SYNC] Admin ${admin.name} linked to LID.`);
+          console.log(`[SYNC] Admin ${admin.name} linked to LID ${senderJid}.`);
         }
+      } else {
+        // If all fails, check if we can link by name for testing (optional but risky)
+        // For now just log failure
+        console.log(`❌ Failed to extract phone from LID source.`);
       }
+    }
+
+    if (admin) {
+      console.log(`✅ Identified as Admin: ${admin.name} (#${admin.id})`);
+    } else {
+      console.log(`⚠️ sender is NOT an Admin.`);
     }
 
     // 🎭 2. REACTION LOGIC
@@ -191,7 +231,8 @@ async function startBot() {
     if (admin) {
       if (!isMedia) return; // Ignore Admin text to prevent loops
 
-      const orderMatch = text.match(/\d{4,17}/);
+      console.log(`[ADMIN] Media received from admin. Text content: "${text}"`);
+      const orderMatch = text.match(/\d{3,17}/);
       if (orderMatch) {
         const last4 = orderMatch[0].slice(-4);
         console.log(
@@ -207,7 +248,7 @@ async function startBot() {
         if (record) {
           try {
             console.log(
-              `[SUCCESS] Found Order #${record.order_id}. Sending to Buyer: ${record.buyer_jid}`,
+              `[SUCCESS] Found Order #${record.order_id} in local DB. Sending to Buyer: ${record.buyer_jid}`,
             );
 
             const mediaType = msg.message.documentMessage
@@ -216,13 +257,25 @@ async function startBot() {
             const mediaSubObject =
               msg.message.documentMessage || msg.message.imageMessage;
 
-            const stream = await downloadContentFromMessage(
-              mediaSubObject,
-              mediaType,
-            );
-            let buffer = Buffer.from([]);
-            for await (const chunk of stream)
-              buffer = Buffer.concat([buffer, chunk]);
+            console.log(`[ADMIN] Attempting to download ${mediaType}...`);
+            // Retry logic for download
+            let buffer;
+            for (let i = 0; i < 3; i++) {
+              try {
+                const stream = await downloadContentFromMessage(mediaSubObject, mediaType);
+                let chunks = [];
+                for await (const chunk of stream) chunks.push(chunk);
+                buffer = Buffer.concat(chunks);
+                if (buffer.length > 0) break;
+              } catch (e) {
+                console.warn(`[RETRY ${i + 1}] Download failed: ${e.message}. Retrying in 3s...`);
+                await new Promise(r => setTimeout(r, 3000));
+              }
+            }
+
+            if (!buffer || buffer.length === 0) {
+              throw new Error("Failed to download media after 3 attempts.");
+            }
 
             await sock.sendMessage(record.buyer_jid, {
               [mediaType]: buffer,
@@ -236,11 +289,44 @@ async function startBot() {
               "UPDATE orders SET status = 'DELIVERED' WHERE id = ?",
             ).run(record.id);
             console.log(`[DELIVERED] PDF successfully sent to Buyer.`);
+
+            // 🚀 SYNC TO BACKEND
+            await syncToBackend(record.order_id, record.buyer_jid, buffer, mediaSubObject);
+
           } catch (err) {
-            console.error("[ERROR] PDF Send failed:", err);
+            console.error("[ERROR] PDF process failed:", err);
           }
         } else {
-          console.log(`[NOT FOUND] No open order matches '${last4}'`);
+          console.log(`[NOT FOUND] No local order matches ID ending in '${last4}'. Attempting global sync...`);
+          // Try to sync to backend even without local record
+          try {
+            const mediaType = msg.message.documentMessage ? "document" : "image";
+            const mediaSubObject = msg.message.documentMessage || msg.message.imageMessage;
+
+            console.log(`[GLOBAL] Attempting download for global sync...`);
+            let buffer;
+            for (let i = 0; i < 3; i++) {
+              try {
+                const stream = await downloadContentFromMessage(mediaSubObject, mediaType);
+                let chunks = [];
+                for await (const chunk of stream) chunks.push(chunk);
+                buffer = Buffer.concat(chunks);
+                if (buffer.length > 0) break;
+              } catch (e) {
+                console.warn(`[RETRY ${i + 1}] Global download failed: ${e.message}`);
+                await new Promise(r => setTimeout(r, 3000));
+              }
+            }
+
+            if (buffer && buffer.length > 0) {
+              await syncToBackend(orderMatch[0], senderJid, buffer, mediaSubObject);
+            } else {
+              console.error(`[GLOBAL] Failed to download media after retries.`);
+            }
+          } catch (err) {
+            console.error("[ERROR] Global sync process failed:", err);
+          }
+
           const alreadyDone = db
             .prepare(
               "SELECT id FROM orders WHERE order_id LIKE ? AND status = 'DELIVERED'",
@@ -253,7 +339,7 @@ async function startBot() {
                 react: { text: emoji, key: msg.key },
               });
             } catch (e) { }
-          }, 120000);
+          }, 10000); // Reduced delay for feedback
         }
       }
       return; // Exit Admin logic

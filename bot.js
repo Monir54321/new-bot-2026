@@ -345,7 +345,8 @@ async function startBot() {
       return; // Exit Admin logic
     }
 
-    // 📦 4. BUYER LOGIC (STRICT TEXT ONLY)
+    // 📦 4. BUYER LOGIC (STRICT TEXT ONLY) - DISABLED AS REQUESTED
+    /* 
     if (!admin) {
       if (isMedia || !isText) return;
 
@@ -393,6 +394,7 @@ async function startBot() {
         }
       }
     }
+    */
   });
 }
 
